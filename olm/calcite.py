@@ -292,7 +292,7 @@ def concHFromCaPCO2Relaxed(Ca, PCO2, T_C = 25.):
 
 #Calculate H+ concentration given Ca and PCO2, makes no relaxed charge
 #balance assumption
-def solutionFromCaPCO2(Ca, PCO2, T_C = 25., per_tol = 0.001):
+def solutionFromCaPCO2(Ca, PCO2, T_C = 25., per_tol = 0.001, max_iter=1000):
     """
     Creates a solution object from a given concentration of calcium and PCO2.
 
@@ -306,7 +306,8 @@ def solutionFromCaPCO2(Ca, PCO2, T_C = 25., per_tol = 0.001):
        temperature of solution in degrees Celsius (default = 25 C)
     per_tol : float
        the fractional change in H concentration between iterations upon which the iteration is terminated
-
+    max_iter : int
+       the number of iterations allowed in the solution. Returns None if solution does not converge in max_iter.
 
     Returns
     -------
@@ -327,6 +328,7 @@ def solutionFromCaPCO2(Ca, PCO2, T_C = 25., per_tol = 0.001):
         K_2 = calc_K_2(T_K)
         K_6 = K_1*(1.+1./K_0)
         found=False
+        niter = 0
         while not(found):
             #estimate activity coefficients
             gamma_H = gamma('H', I_guess, T_C=T_C_in)
@@ -348,6 +350,9 @@ def solutionFromCaPCO2(Ca, PCO2, T_C = 25., per_tol = 0.001):
                 H_guess = H_new
                 I_guess = I_new
             #calculate non-charge ions
+            niter += 1
+            if niter > max_iter:
+                return None
         CO2 = K_H*PCO2_in
         H2CO3 = (K_H/K_0)*PCO2_in
         H2CO3s = H2CO3 + CO2
@@ -1338,7 +1343,7 @@ def palmerFromSolution(sol, PCO2=np.array([]), rho=2.6, impure=True):
         return calc_rate(sol, PCO2, rho)
 
 
-def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol=0.001, error=False, error_num=100, Ca_err=None, PCO2_err=None, molL=False):
+def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol=0.001, error=False, error_num=100, Ca_err=None, PCO2_err=None, molL=False, confidence=0., return_samples = False):
     """
     Calculates the calcite/limestone dissolution rate from given calcium concentration and PCO2. Optionally uses Monte Carlo error propagation to calculate uncertainty in rates.
 
@@ -1368,6 +1373,10 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
        Percent error in PCO2 values (1=100%)
     molL : boolean
        Are Ca units in mol/L. If so, set to true. Otherwise, units assumed are mg/L. (default=False, i.e. mg/L)
+    confidence : float
+       If non-zero then confidence intervals will be used in error estimation (e.g. 90 = 90% confidence). Default is 0.
+    return_samples : boolean
+       If true (default is false), then return entire random samples within error arrays.
 
     Returns
     -------
@@ -1378,7 +1387,7 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
 
     """
     #Function for Monte Carlo error estimation
-    def err_est(Ca,PCO2,T_C):
+    def err_est(Ca,PCO2,T_C,Ca_err,PCO2_err):
         rate_sample = np.zeros(error_num)
         Ca_factor = 1. + Ca_err*np.random.randn(error_num)
         Ca_sample = Ca*Ca_factor
@@ -1387,7 +1396,16 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
         for j in np.arange(error_num):
         #    print j, Ca_sample[j], PCO2_sample[j]
             #Create solution object
-            rand_sol = solutionFromCaPCO2(Ca_sample[j], PCO2_sample[j], T_C=T_C, per_tol=per_tol)
+            found = False
+            while not found:
+                rand_sol = solutionFromCaPCO2(Ca_sample[j], PCO2_sample[j], T_C=T_C, per_tol=per_tol)
+                if type(rand_sol) != type(None):
+                    found=True
+                else:
+                    new_Ca_factor = 1. + Ca_err*np.random.randn(1)
+                    Ca_sample[j] = Ca*new_Ca_factor
+                    print('Solution did not converge for this error calculation.')
+                    print('Ca_sample=',Ca_sample[j], '   PCO2_sample=',PCO2_sample[j])
             #Calculate dissolution rate
             if method=='PWP':
                 rate_sample[j] = pwp_to_mm_yr(pwpFromSolution(rand_sol, PCO2=PCO2_sample[j]), rho=rho)
@@ -1396,9 +1414,16 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
             else:
                 print( "Invalid method keyword!")
                 return None
-        #Estimated error is standard deviation from random sample
-        return np.std(rate_sample)
-
+        if return_samples:
+            return rate_sample
+        if confidence==0:
+            #Estimated error is standard deviation from random sample
+            return np.std(rate_sample)
+        else:
+            #Error estimated using confidence intervals
+            lower = np.percentile(rate_sample, 100.-confidence)
+            upper = np.percentile(rate_sample, confidence)
+            return [upper, lower]
 
 
     if not molL:
@@ -1406,12 +1431,18 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
         Ca = mgL_to_molL(Ca, 'Ca')
     is_series = (type(Ca)==pandas.core.series.Series)
     if (type(Ca)==np.ndarray) or is_series:
-        rate_arr = np.empty(np.size(Ca), dtype=object)
+        rate_arr = np.empty(np.size(Ca), dtype=float)
         if error:
-            err_arr = np.empty(np.size(Ca), dtype=object)
+            if return_samples:
+                err_arr = np.empty((np.size(Ca),error_num), dtype=float)
+            elif confidence == 0:
+                err_arr = np.empty(np.size(Ca), dtype=float)
+            else:
+                err_arr = np.empty((np.size(Ca),2), dtype=float)
         for i, this_Ca in enumerate(Ca):
             if (i % 100)==0:
                 print( "Solution number "+str(i))
+                #print( "Ca = ", this_Ca, "  CO2 = ", PCO2[i], '  Ca_err = ', Ca_err[i], ' CO2_err = ', PCO2_err)
             #Create solution object
             if np.size(T_C)==1:
                 sol = solutionFromCaPCO2(this_Ca, PCO2[i], T_C=T_C, per_tol=per_tol)
@@ -1428,14 +1459,34 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
             #Monte Carlo error estimate on rate
             if error:
                 if np.size(T_C)==1:
-                    err_arr[i] = err_est(this_Ca, PCO2[i], T_C)
+                    if confidence == 0 and not return_samples:
+                        err_arr[i] = err_est(this_Ca, PCO2[i], T_C, Ca_err, PCO2_err)
+                    else:
+                        err_arr[i,:] = err_est(this_Ca, PCO2[i], T_C, Ca_err, PCO2_err)
                 else:
-                    err_arr[i] = err_est(this_Ca, PCO2[i], T_C[i])
+                    if np.size(Ca_err)==1:
+                        this_Ca_err = Ca_err
+                    else:
+                        this_Ca_err = Ca_err[i]
+                    if np.size(PCO2_err)==1:
+                        this_PCO2_err = PCO2_err
+                    else:
+                        this_PCO2_err = PCO2_err[i]
+                    if confidence == 0 and not return_samples:
+                        err_arr[i] = err_est(this_Ca, PCO2[i], T_C[i], this_Ca_err, this_PCO2_err)
+                    else:
+                        err_arr[i,:] = err_est(this_Ca, PCO2[i], T_C[i], this_Ca_err, this_PCO2_err)
 
         if is_series:
             rate_arr = pandas.Series(rate_arr, index=Ca.index)
             if error:
-                err_arr = pandas.Series(err_arr, index=Ca.index)
+                if confidence==0 and not return_samples:
+                    err_arr = pandas.Series(err_arr, index=Ca.index, dtype=float)
+                else:
+                    if return_samples:
+                        err_arr = pandas.DataFrame(err_arr, index=Ca.index, dtype=float)
+                    else:
+                        err_arr = pandas.DataFrame(err_arr, index=Ca.index, columns=['lower','upper'], dtype=float)
         if error:
             return rate_arr, err_arr
         else:
@@ -1452,6 +1503,6 @@ def dissRateFromCaPCO2(Ca, PCO2, T_C, rho=2.6, method=None, impure=True, per_tol
             print("Invalid method keyword!")
             return None
         if error:
-            err = err_est(Ca, PCO2, T_C)
+            err = err_est(Ca, PCO2, T_C, Ca_err, PCO2_err)
             return R, err
         return R
